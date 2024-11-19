@@ -76,9 +76,18 @@ usertrap(void)
   if(killed(p))
     exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  // If this is a timer interrupt.
+  if(which_dev == 2) {
+    // If alarm is set and callback is not running and time to trigger
+    if(p->alarm_ticks && !p->alarm_incallback && !--(p->alarm_ticksleft)) {
+      p->alarm_ticksleft = p->alarm_ticks;
+      p->alarm_trapframe = *(p->trapframe);
+      p->trapframe->epc = p->alarm_callback;
+      p->alarm_incallback = 1;
+    }
+    // give up the CPU
     yield();
+  }
 
   usertrapret();
 }
