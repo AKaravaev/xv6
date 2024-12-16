@@ -85,8 +85,10 @@ kvminithart()
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
-  if(va >= MAXVA)
+  if(va >= MAXVA) {
+    printf("%p > %p\n", (void*)va, (void*)MAXVA);
     panic("walk");
+  }
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
@@ -312,31 +314,25 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
-  pte_t *pte;
+  pte_t *pte_src, *pte_dst;
   uint64 pa, i;
-  uint flags;
-  char *mem;
-
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+    if((pte_src = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
+    if((*pte_src & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    pa = PTE2PA(*pte_src);
+    if (*pte_src & PTE_W) {
+      *pte_src = (*pte_src & ~PTE_W) | PTE_COW;
     }
+    if((pte_dst = walk(new, i, 1)) == 0)
+      return -1;
+    if(*pte_dst & PTE_V)
+      panic("uvmcopy: remap");
+    *pte_dst = *pte_src;
+    krefinc((void *)pa);
   }
   return 0;
-
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
 }
 
 // mark a PTE invalid for user access.
@@ -360,6 +356,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
   pte_t *pte;
+  struct proc *p;
+  void *mem;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
@@ -367,9 +365,22 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       return -1;
     pte = walk(pagetable, va0, 0);
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+       (((*pte & PTE_W) == 0) && ((*pte & PTE_COW) == 0)))
       return -1;
     pa0 = PTE2PA(*pte);
+    p = myproc();
+    if (*pte & PTE_COW) {
+      if((mem = kcopy((void*)pa0))) {
+        *pte = (PA2PTE(mem) | PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+        pa0 = (uint64)mem;
+      }
+      else {
+        // Not enough memory for copy-on-write
+        setkilled(p);
+      }
+    }
+    if(killed(p))
+      exit(-1);
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;

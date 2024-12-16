@@ -29,6 +29,24 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
+int cow(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+  void *mem;
+
+  if (va >= MAXVA)
+    return -1;
+  pte = walk(pagetable, va, 0);
+  if (!pte || !(*pte & PTE_COW))
+    return -1;
+  pa = PTE2PA(*pte);
+  mem = kcopy((void*)pa);
+  if(!mem)
+    return -1;
+  *pte = (PA2PTE(mem) | PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  return 0;
+}
+
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
@@ -65,6 +83,14 @@ usertrap(void)
     intr_on();
 
     syscall();
+  }
+  else if (r_scause() == 15) {
+    // Page fault on write
+    if (cow(p->pagetable, r_stval()) == -1) {
+      printf("usertrap(): page fault pid=%d\n", p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
