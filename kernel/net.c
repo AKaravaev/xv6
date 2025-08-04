@@ -16,6 +16,7 @@ static uint32 local_ip = MAKE_IP_ADDR(10, 0, 2, 15);
 
 // qemu host's ethernet address.
 static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
+static struct socket sockets[MAX_SOCKETS];
 
 static struct spinlock netlock;
 
@@ -23,8 +24,10 @@ void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+  for(int i=0; i < MAX_SOCKETS; i++) {
+    sockets[i].port = 0;
+  }
 }
-
 
 //
 // bind(int port)
@@ -34,10 +37,23 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
-
+  int port;
+  argint(0, &port);
+  for (int i=0; i < MAX_SOCKETS; i++) {
+    if (sockets[i].port == port) return 0;
+  }
+  acquire(&netlock);
+  for (int i=0; i < MAX_SOCKETS; i++) {
+    if (sockets[i].port) continue;
+    sockets[i].port = port;
+    sockets[i].b_start = 0;
+    sockets[i].b_end = 0;
+    for (int j=0; j < SOCKET_BUFFER_SIZE; j++)
+      sockets[i].buffer[j] = 0;
+    release(&netlock);
+    return 0;
+  }
+  release(&netlock);
   return -1;
 }
 
@@ -49,10 +65,16 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
-
+  int port;
+  argint(0, &port);
+  acquire(&netlock);
+  for (int i=0; i < MAX_SOCKETS; i++) {
+    if (sockets[i].port == port) {
+      sockets[i].port = 0;
+      break;
+    }
+  }
+  release(&netlock);
   return 0;
 }
 
@@ -74,9 +96,45 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
+  struct proc *p = myproc();
+  int dport, maxlen;
+  uint64 src, sport, buf;
+  int b_start;
+
+  argint(0, &dport);
+  argaddr(1, &src);
+  argaddr(2, &sport);
+  argaddr(3, &buf);
+  argint(4, &maxlen);
+
+  acquire(&netlock);
+  for (int i=0; i < MAX_SOCKETS; i++) {
+    if (sockets[i].port == dport) {
+      b_start = sockets[i].b_start;
+      while (!sockets[i].buffer[b_start]) {
+        // Waiting for the data to arrive
+        sleep((char *)sys_recv + dport, &netlock);
+      }
+      // Reading the UDP packet
+      struct eth *eth_header = (struct eth*) sockets[i].buffer[b_start];
+      struct ip *ip_header = (struct ip*) (eth_header + 1);
+      struct udp *udp_header = (struct udp*) (ip_header + 1);
+      uint32 ip_src = ntohl(ip_header->ip_src);
+      copyout(p->pagetable, src, (char *)&ip_src, sizeof(int));
+      uint16 udp_sport = ntohs(udp_header->sport);
+      copyout(p->pagetable, sport, (char *)&udp_sport, sizeof(short));
+      uint16 load_len = ntohs(udp_header->ulen) - sizeof(struct udp);
+      uint64 len = maxlen < load_len ? maxlen : load_len;
+      copyout(p->pagetable, buf, (char *)(udp_header + 1), len);
+      kfree (sockets[i].buffer[b_start]);
+      sockets[i].buffer[b_start] = 0;
+      sockets[i].b_start = (b_start + 1) % SOCKET_BUFFER_SIZE;
+      release(&netlock);
+      return len;
+    }
+  }
+  release(&netlock);
+  // dport is not bound
   return -1;
 }
 
@@ -179,6 +237,52 @@ sys_send(void)
   return 0;
 }
 
+// Buf - received packet
+void udp_rx(char *buf, int len) {
+  int drop_packet = 0;
+  int port = 0;
+
+  // Ignore malformed UDP
+  int head_size = sizeof(struct eth) + sizeof(struct ip);
+  if (len < head_size + sizeof(struct udp))
+    drop_packet = 1;
+ 
+  // Reading UDP header
+  struct udp *udp_header = (struct udp *) (buf + head_size);
+  // Dropping if packet is not well formed
+  if (len < ntohs(udp_header->ulen) + head_size)
+    drop_packet = 1;
+
+  if (drop_packet) {
+    kfree(buf);
+    return;
+  }
+
+  // Will be dropping the packet if we won't find the appropriate buffer
+  drop_packet = 1;
+  port = ntohs(udp_header->dport);
+  acquire(&netlock);
+  // If port is bound and doesn't exceed buffer size, save the packet
+  for (int i=0; i < MAX_SOCKETS; i++) {
+    // Looking for a packet with a matching port 
+    if (sockets[i].port == port){
+      int b_end = sockets[i].b_end;
+      // Drop the packet if buffer overflown
+      if (sockets[i].buffer[b_end]) break;
+      // Otherwise saving a packet to the buffer
+      sockets[i].buffer[b_end] = buf;
+      sockets[i].b_end = (b_end + 1) % SOCKET_BUFFER_SIZE;
+      drop_packet = 0;
+      break;
+    }
+  }
+  release(&netlock);
+  if (drop_packet)
+    kfree(buf);
+  else
+    wakeup((char *)sys_recv + port);
+}
+
 void
 ip_rx(char *buf, int len)
 {
@@ -188,10 +292,14 @@ ip_rx(char *buf, int len)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  struct ip *ip_header = (struct ip *)(buf + sizeof(struct eth));
+
+  switch(ip_header->ip_p) {
+    case IPPROTO_UDP:
+      // Passing UDP datagram for processing
+      udp_rx(buf, len);
+      break;
+  }
 }
 
 //

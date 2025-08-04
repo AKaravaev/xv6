@@ -125,3 +125,13 @@ struct dns_data {
   uint32 ttl;
   uint16 len;
 } __attribute__((packed));
+
+#define MAX_SOCKETS 16
+#define SOCKET_BUFFER_SIZE 16
+
+struct socket {
+  int port;
+  char* buffer[SOCKET_BUFFER_SIZE];
+  int b_start;
+  int b_end; //First empty buffer slot
+} __attribute__((packed));
