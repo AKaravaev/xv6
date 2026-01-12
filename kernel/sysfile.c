@@ -169,6 +169,53 @@ bad:
   return -1;
 }
 
+uint64 sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  char name[DIRSIZ];
+  struct inode *dp, *ip;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  if((dp = nameiparent(path, name)) == 0) {
+    iput(dp);
+    end_op();
+    return -1;
+  }
+
+  // Allocating a new inode for the symlink
+  ilock(dp);
+  if((ip = ialloc(dp->dev, T_SYMLINK)) == 0)
+    goto bad;
+
+  // Attaching new inode to the directory
+  if(dirlink(dp, name, ip->inum) < 0)
+    goto bad;
+
+  ilock(ip);
+  ip->nlink=1;
+  // Saving the symlink path into the first datablock
+  if(writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+    iunlock(ip);
+    goto bad;
+  }
+
+  iunlockput(ip);
+  iunlockput(dp);
+
+  end_op();
+  return 0;
+
+bad:
+  iput(ip);
+  iunlockput(dp);
+  end_op();
+  return -1;
+}
+
 // Is the directory dp empty except for "." and ".." ?
 static int
 isdirempty(struct inode *dp)
@@ -301,6 +348,29 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+static struct inode* follow_symlink(struct inode* ip){
+  char path[MAXPATH];
+  struct inode *ip2;
+  int i;
+
+  for (i=0;i<MAXSYMLINKRECURR; i++){
+    if(ip->type != T_SYMLINK) break;
+    readi(ip, 0, (uint64)path, 0, MAXPATH); 
+    if(!(ip2 = namei(path))) {
+      iunlockput(ip);
+      return 0;
+    }
+    iunlockput(ip);
+    ip = ip2;
+    ilock(ip);
+  }
+  if (i == MAXSYMLINKRECURR) {
+    iunlockput(ip);
+    return 0;
+  }
+  return ip;
+}
+
 uint64
 sys_open(void)
 {
@@ -328,6 +398,13 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+    // If symlink, we should follow the chain
+    if(ip->type == T_SYMLINK
+        && !(omode & O_NOFOLLOW)
+        && !(ip = follow_symlink(ip))) {
+      end_op();
+      return -1;
+    }
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
