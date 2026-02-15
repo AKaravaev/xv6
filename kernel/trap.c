@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -46,6 +47,7 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
+  int vma_num;
   
   // save user program counter.
   p->trapframe->epc = r_sepc();
@@ -65,6 +67,14 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if((r_scause() == 13 || r_scause() == 15) &&
+      (vma_num=proc_getvmanumbyaddr(p, r_stval())) != -1){
+    if (r_scause() == 15 && !(p->vmas[vma_num].prot & PROT_WRITE)){
+      printf("Writing into a read-only VMA\n");
+      setkilled(p);
+    }
+    if(vmapagefault(p->pagetable, &(p->vmas[vma_num]), r_stval()))
+      setkilled(p);
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -79,7 +89,6 @@ usertrap(void)
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
-
   usertrapret();
 }
 

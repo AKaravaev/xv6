@@ -5,6 +5,10 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "defs.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -448,4 +452,35 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int vmapagefault(pagetable_t pagetable, struct vma* vma, uint64 va){
+  void *pa;
+  int perm = PTE_U;
+  uint64 page_start = PGROUNDDOWN(va);
+  uint64 load_addr = page_start<vma->start_addr?vma->start_addr:page_start;
+  uint64 offset = load_addr-vma->start_addr+vma->offset;
+  uint64 len = vma->end_addr-load_addr+1;
+  len = len <= PGSIZE ? len : PGSIZE;
+  if(!(pa = kalloc())){
+    printf("Not enough memory for vma\n");
+    return -1;
+  }
+
+  memset(pa, 0, PGSIZE);
+  if(fileload(vma->file, (uint64)pa, offset, len)){
+    kfree(pa);
+    printf("Error opening file\n");
+    return -1;
+  }
+
+  if (vma->prot & PROT_READ) perm |= PTE_R;
+  if (vma->prot & PROT_WRITE) perm |= PTE_W;
+
+  if(mappages(pagetable, (uint64)page_start, PGSIZE, (uint64)pa, perm)){
+    kfree(pa);
+    printf("Error mapping vma pages\n");
+    return -1;
+  }
+  return 0;
 }

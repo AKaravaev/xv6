@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -296,6 +300,18 @@ fork(void)
   }
   np->sz = p->sz;
 
+  //Copy VMA memory
+  for(i=0; i<NVMA && p->vmas[i].start_addr; i++){
+    if(proc_addvma(np, p->vmas[i].end_addr - p->vmas[i].start_addr + 1,
+                      p->vmas[i].prot,
+                      p->vmas[i].flags,
+                      p->vmas[i].offset,
+                      p->vmas[i].file)==(void*)-1){
+        freeproc(np);
+        release(&np->lock);
+        return -1;
+    }
+  }
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -350,6 +366,11 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  for(int i=NVMA-1; i >=0; i--){
+    if (p->vmas[i].start_addr)
+      proc_removevma(p, p->vmas[i].start_addr, p->vmas[i].end_addr - p->vmas[i].start_addr + 1);
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
@@ -692,4 +713,131 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+static int shift_vmas(struct vma *vmas, int index){
+  int i;
+  for(i=index+1; i<NVMA && vmas[i].start_addr; i++);
+  // No free VMAs
+  if (i==NVMA) return -1;
+  for(;i>index;i--)
+    vmas[i]=vmas[i-1];
+  return 0;
+}
+
+static int compact_vmas(struct vma *vmas, int index){
+  if (index >= NVMA || index < 0) return -1;
+  for(int i = index; i < NVMA - 1; i++)
+    vmas[i] = vmas[i+1];
+  vmas[NVMA-1].start_addr = 0;
+  return 0;
+}
+
+void *proc_addvma(struct proc *p, uint64 len, int prot, int flags, uint64 offset, struct file *f){
+  struct vma* vmas = p->vmas;
+  uint64 allocsize = PGROUNDUP(len);
+  uint64 start_addr = TRAPFRAME - allocsize;
+  int i;
+
+  if (!len) return (void*)-1;
+  if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable) return (void *)-1;
+
+  // Find free vma
+  for(i=0; i<NVMA; i++){
+    if(!(vmas[i].start_addr)) break;
+    // Check if we can fit in between this and previous vmas
+    if(i>0 && PGROUNDDOWN(vmas[i-1].start_addr)-PGROUNDUP(vmas[i].end_addr) > allocsize){
+      // We can fit into this space, so let's try shifting
+      if(shift_vmas(vmas, i)) return (void *)-1;
+    }
+  }
+  if (i>0)
+    start_addr = vmas[i-1].start_addr - allocsize;
+  // Maximum number of VMAs reached
+  if (i==NVMA) return (void *)-1;
+  vmas[i].start_addr = start_addr;
+  vmas[i].end_addr = start_addr + len - 1;
+  vmas[i].offset = 0;
+  vmas[i].prot = prot;
+  vmas[i].flags = flags;
+  filedup(f);
+  vmas[i].file = f;
+  return (void *)start_addr;
+}
+
+int proc_getvmanumbyaddr(struct proc* p, uint64 va){
+  struct vma* vmas = p->vmas;
+  for(int i=0; i<NVMA && vmas[i].start_addr && va <= vmas[i].end_addr; i++){
+    if (va >= vmas[i].start_addr)
+      return i;
+  }
+  return -1;
+}
+
+int proc_removevma(struct proc *p, uint64 addr, uint64 len){
+  int vma_num = proc_getvmanumbyaddr(p, addr);
+  struct vma* vma = &p->vmas[vma_num];
+  struct file* f;
+  pte_t *pte;
+  uint64 va, pa, block_len, file_off;
+  int write_back;
+
+  // No holes allowed
+  if(vma->end_addr < addr+ len - 1 ||
+    (vma->start_addr != addr && vma->end_addr != addr + len - 1))
+    return -1;
+
+  f = vma->file;
+  write_back = (vma->flags & MAP_SHARED) && f->writable;
+
+  // If we need to write changes back to the file
+  if (write_back){
+    begin_op();
+    ilock(f->ip);
+  }
+
+  // Going through all the pages covering the range
+  for (uint64 page_start = PGROUNDDOWN(addr); page_start <= PGROUNDDOWN(addr+len-1); page_start += PGSIZE){
+    // Write back if dirty
+    pte = walk(p->pagetable, page_start, 0);
+    // Ignore if not mapped
+    if (!pte || !(*pte & PTE_V)) continue;
+
+    // Write back to file if the dirty bit is set
+    if(write_back && (*pte & PTE_D)){
+      pa = page_start < addr ? PTE2PA(*pte) + addr-page_start : PTE2PA(*pte);
+      va = page_start < addr ? addr : page_start;
+      file_off = va-vma->start_addr+vma->offset;
+      block_len = addr + len - va < PGSIZE ? addr + len - va : PGSIZE;
+      // Should not be writing beyond current file size
+      if(file_off < f->ip->size){
+        if (file_off + block_len > f->ip->size)
+          block_len = f->ip->size - file_off;
+        writei(f->ip, 0, pa, file_off, block_len);
+      }
+    }
+
+    // Now deallocating the page
+    if ((page_start >= addr || vma->start_addr == addr) &&
+      (page_start + PGSIZE <= addr + len || vma->end_addr == addr+len-1)){
+      uvmunmap(p->pagetable, page_start, 1, 1);
+    }
+  }
+
+  if (write_back){
+    iunlock(f->ip);
+    end_op();
+  }
+
+  if(vma->start_addr == addr && vma->end_addr == addr + len -1) {
+    fileclose(f);
+    compact_vmas(p->vmas, vma_num);
+  }
+  else if (vma->start_addr == addr){
+    vma->start_addr = addr + len;
+    vma->offset+=len;
+  }
+  else
+    vma->end_addr = addr - 1;
+  return 0;
 }

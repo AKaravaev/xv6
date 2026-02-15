@@ -180,3 +180,12 @@ filewrite(struct file *f, uint64 addr, int n)
   return ret;
 }
 
+int fileload(struct file* f, uint64 pa, uint64 offset, uint64 len){
+  int tot;
+  if(!(f->readable) || f->type != FD_INODE)
+    return -1;
+  ilock(f->ip);
+  tot = readi(f->ip, 0, pa, offset, len);
+  iunlock(f->ip);
+  return -1 ? tot == -1 : 0;
+}

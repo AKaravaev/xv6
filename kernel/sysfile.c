@@ -503,3 +503,29 @@ sys_pipe(void)
   }
   return 0;
 }
+
+void *
+sys_mmap(void)
+{
+  uint64 len;
+  int prot, flags;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argfd(4, 0, &f);
+
+  return proc_addvma(p, len, prot, flags, 0, f);
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, len;
+  struct proc *p = myproc();
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  return proc_removevma(p, addr, len);
+}

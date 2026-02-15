@@ -12,6 +12,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct vma;
 
 // bio.c
 void            binit(void);
@@ -37,6 +38,7 @@ void            fileinit(void);
 int             fileread(struct file*, uint64, int n);
 int             filestat(struct file*, uint64 addr);
 int             filewrite(struct file*, uint64, int n);
+int             fileload(struct file* f, uint64 va, uint64 offset, uint64 len);
 
 // fs.c
 void            fsinit(int);
@@ -110,6 +112,9 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+void*           proc_addvma(struct proc *p, uint64 len, int prot, int flags, uint64 offset, struct file *f);
+int             proc_getvmanumbyaddr(struct proc* proc, uint64 va);
+int             proc_removevma(struct proc *p, uint64 addr, uint64 len);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -187,6 +192,7 @@ void            vmprint(pagetable_t);
 #ifdef LAB_PGTBL
 pte_t*          pgpte(pagetable_t, uint64);
 #endif
+int             vmapagefault(pagetable_t pagetable, struct vma* vma, uint64 va);
 
 // plic.c
 void            plicinit(void);
